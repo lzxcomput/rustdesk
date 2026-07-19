@@ -18,6 +18,8 @@ use crate::platform::linux_desktop_manager;
 use crate::platform::WallPaperRemover;
 #[cfg(windows)]
 use crate::portable_service::client as portable_client;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use crate::session_audit::{self, AuditSession, Endpoint};
 use crate::{
     client::{
         new_voice_call_request, new_voice_call_response, start_audio_thread, MediaData, MediaSender,
@@ -49,6 +51,8 @@ use hbb_common::{
     },
     tokio_util::codec::{BytesCodec, Framed},
 };
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use hbb_common::anyhow::anyhow;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use scrap::android::{call_main_service_key_event, call_main_service_pointer_input};
 use scrap::camera;
@@ -389,6 +393,12 @@ pub struct Connection {
     tx_post_seq: mpsc::UnboundedSender<(String, Value)>,
     conn_audit_primary_auth: ConnAuditPrimaryAuth,
     conn_audit_two_factor: ConnAuditTwoFactor,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    audit_session: Option<AuditSession>,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    audit_committed: bool,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    audit_pending_sub_service: bool,
     // Tracks read job IDs delegated to CM process.
     // When a read job is delegated to CM (via FS::ReadFile), the job id is added here.
     // Used to filter stale responses (FileBlockFromCM, FileReadDone, etc.) for
@@ -585,6 +595,12 @@ impl Connection {
             cm_read_job_ids: HashSet::new(),
             terminal_service_id: "".to_owned(),
             terminal_persistent: false,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            audit_session: None,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            audit_committed: false,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            audit_pending_sub_service: false,
             scope_violation_messages: HashSet::new(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal_user_token: None,
@@ -1610,6 +1626,74 @@ impl Connection {
         }
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    async fn prepare_session_audit(&mut self, response: &mut LoginResponse) -> ResultType<bool> {
+        let Some(context) = self.lr.audit.as_ref() else {
+            return Ok(false);
+        };
+        let session_id =
+            uuid::Uuid::from_slice(&context.session_id).context("invalid session audit id")?;
+        if session_id.is_nil() {
+            bail!("session audit id must not be nil");
+        }
+        let peer_identity = context
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing controller audit identity"))?;
+        let local_hostname = crate::whoami_hostname();
+        let local_username = crate::platform::get_active_username();
+        let local_ip = self.stream.local_addr().ip().to_string();
+        let local = Endpoint::new(
+            local_ip.clone(),
+            local_hostname.clone(),
+            local_username.clone(),
+        );
+        let peer = Endpoint::new(
+            self.ip.clone(),
+            peer_identity.hostname.clone(),
+            peer_identity.login_username.clone(),
+        );
+        let session = session_audit::server_session(session_id, local, peer);
+        session.start().await?;
+        response.audit_ready = Some(AuditReady {
+            session_id: context.session_id.clone(),
+            endpoint: Some(AuditEndpoint {
+                ip: local_ip,
+                hostname: local_hostname,
+                login_username: local_username,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        })
+        .into();
+        self.audit_session = Some(session);
+        self.audit_committed = false;
+        Ok(true)
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    async fn handle_audit_commit(&mut self, commit: &AuditCommit) -> bool {
+        let Some(session) = self.audit_session.as_ref().cloned() else {
+            log::warn!("Received an unexpected session audit commit");
+            self.on_close("Session audit commit without ready", false)
+                .await;
+            return false;
+        };
+        if commit.session_id.as_ref() != session.session_id().as_bytes() {
+            log::warn!("Received a mismatched session audit commit");
+            self.on_close("Session audit id mismatch", false).await;
+            return false;
+        }
+        session.reconnected();
+        self.audit_committed = true;
+        if self.audit_pending_sub_service {
+            self.audit_pending_sub_service = false;
+            self.try_sub_monitor_services();
+        }
+        true
+    }
+
     // Returns whether this connection should be kept alive.
     // `true` does not necessarily mean authorization succeeded (e.g. REQUIRE_2FA case).
     async fn send_logon_response_and_keep_alive(&mut self) -> bool {
@@ -1926,9 +2010,27 @@ impl Connection {
             }
             self.on_remote_authorized();
         }
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let (audit_prepared, audit_failed) = if sub_service {
+            match self.prepare_session_audit(&mut res).await {
+                Ok(prepared) => (prepared, false),
+                Err(err) => {
+                    log::error!("Failed to prepare controlled-side session audit: {}", err);
+                    res.set_error(format!("Session audit unavailable: {err}"));
+                    (false, true)
+                }
+            }
+        } else {
+            (false, false)
+        };
         let mut msg_out = Message::new();
         msg_out.set_login_response(res);
         self.send(msg_out).await;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if audit_failed {
+            self.authorized = false;
+            return false;
+        }
         self.update_scoped_login_options().await;
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
             self.keyboard = false;
@@ -1954,6 +2056,13 @@ impl Connection {
             self.send_permission(Permission::Keyboard, false).await;
         } else if sub_service {
             if !wait_session_id_confirm {
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                if audit_prepared {
+                    self.audit_pending_sub_service = true;
+                } else {
+                    self.try_sub_monitor_services();
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 self.try_sub_monitor_services();
             }
         }
@@ -2514,6 +2623,15 @@ impl Connection {
             }
         }
         if self.authorized {
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            if let Some(message::Union::AuditCommit(commit)) = msg.union.as_ref() {
+                return self.handle_audit_commit(commit).await;
+            }
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            if self.audit_session.is_some() && !self.audit_committed {
+                log::warn!("Ignoring remote-control data before session audit commit");
+                return true;
+            }
             if matches!(msg.union.as_ref(), Some(message::Union::LoginRequest(_))) {
                 return true;
             }
@@ -4785,6 +4903,25 @@ impl Connection {
             return;
         }
         self.closed = true;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(session) = self.audit_session.as_ref().cloned() {
+            if self.audit_committed {
+                let (end_reason, initiator, grace) = session_audit::close_reason(reason);
+                if grace {
+                    session.begin_reconnect_grace(end_reason, initiator);
+                } else if let Err(err) = session.finish(end_reason, initiator).await {
+                    log::error!("Failed to finish controlled-side session audit: {}", err);
+                }
+            } else if let Err(err) = session
+                .finish(
+                    session_audit::EndReason::Unknown,
+                    session_audit::EndInitiator::System,
+                )
+                .await
+            {
+                log::error!("Failed to close uncommitted session audit: {}", err);
+            }
+        }
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //

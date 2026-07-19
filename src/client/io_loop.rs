@@ -1,5 +1,7 @@
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::{update_clipboard, ClipboardSide};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use crate::session_audit::{AuditSession, Endpoint, Role};
 #[cfg(not(any(target_os = "ios")))]
 use crate::{audio_service, clipboard::CLIPBOARD_INTERVAL, ConnInner, CLIENT_SERVER};
 use crate::{
@@ -25,8 +27,11 @@ use clipboard::ContextSend;
 use crossbeam_queue::ArrayQueue;
 #[cfg(not(target_os = "ios"))]
 use hbb_common::tokio::sync::mpsc::error::TryRecvError;
+#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+use hbb_common::tokio::sync::Mutex as TokioMutex;
 use hbb_common::{
     allow_err,
+    anyhow::anyhow,
     config::{self, LocalConfig, PeerConfig, TransferSerde},
     fs::{
         self, can_enable_overwrite_detection, get_job, get_string, new_send_confirm,
@@ -42,10 +47,8 @@ use hbb_common::{
         sync::mpsc,
         time::{self, Duration, Instant},
     },
-    Stream,
+    ResultType, Stream,
 };
-#[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
-use hbb_common::{tokio::sync::Mutex as TokioMutex, ResultType};
 use scrap::CodecFormat;
 use std::{
     collections::HashMap,
@@ -83,6 +86,8 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    local_close_requested: bool,
+    peer_close_requested: bool,
 }
 
 #[derive(Default)]
@@ -132,6 +137,8 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            local_close_requested: false,
+            peer_close_requested: false,
         }
     }
 
@@ -375,6 +382,42 @@ impl<T: InvokeUiSession> Remote<T> {
             Client::try_stop_clipboard();
         }
 
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if self.handler.is_default() && _set_disconnected_ok {
+            if let Some(session) = self.handler.lc.read().unwrap().audit_session.clone() {
+                if self.peer_close_requested {
+                    tokio::spawn(async move {
+                        if let Err(err) = session
+                            .finish(
+                                crate::session_audit::EndReason::PeerClosed,
+                                crate::session_audit::EndInitiator::Peer,
+                            )
+                            .await
+                        {
+                            log::error!("Failed to finish controller-side session audit: {}", err);
+                        }
+                    });
+                } else if self.local_close_requested {
+                    tokio::spawn(async move {
+                        if let Err(err) = session
+                            .finish(
+                                crate::session_audit::EndReason::LocalUserClosed,
+                                crate::session_audit::EndInitiator::Local,
+                            )
+                            .await
+                        {
+                            log::error!("Failed to finish controller-side session audit: {}", err);
+                        }
+                    });
+                } else {
+                    session.begin_reconnect_grace(
+                        crate::session_audit::EndReason::NetworkLost,
+                        crate::session_audit::EndInitiator::Network,
+                    );
+                }
+            }
+        }
+
         #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
         if self.handler.is_default() && _set_disconnected_ok {
             // Linux client cleanup runs synchronously in try_stop_clipboard() before FUSE is
@@ -565,6 +608,7 @@ impl<T: InvokeUiSession> Remote<T> {
     async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {
         match data {
             Data::Close => {
+                self.local_close_requested = true;
                 self.send_close_reason(peer, "").await;
                 return false;
             }
@@ -1357,100 +1401,123 @@ impl<T: InvokeUiSession> Remote<T> {
                         .handle_hash(&self.handler.password.clone(), hash, peer)
                         .await;
                 }
-                Some(message::Union::LoginResponse(lr)) => match lr.union {
-                    Some(login_response::Union::Error(err)) => {
-                        if err == client::REQUIRE_2FA {
-                            self.handler.lc.write().unwrap().enable_trusted_devices =
-                                lr.enable_trusted_devices;
-                        }
-                        if !self.handler.handle_login_error(&err) {
-                            return false;
-                        }
-                    }
-                    Some(login_response::Union::PeerInfo(pi)) => {
-                        let peer_version = pi.version.clone();
-                        let peer_platform = pi.platform.clone();
-                        self.set_peer_info(&pi);
-                        if self.handler.is_view_camera() {
-                            if !self.check_view_camera_support(&peer_version, &peer_platform) {
-                                self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                Some(message::Union::LoginResponse(lr)) => {
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let audit_ready = lr.audit_ready.as_ref().cloned();
+                    match lr.union {
+                        Some(login_response::Union::Error(err)) => {
+                            if err == client::REQUIRE_2FA {
+                                self.handler.lc.write().unwrap().enable_trusted_devices =
+                                    lr.enable_trusted_devices;
+                            }
+                            if !self.handler.handle_login_error(&err) {
                                 return false;
                             }
                         }
-                        if self.handler.is_terminal() {
-                            if !self.check_terminal_support(&peer_version) {
-                                self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                        Some(login_response::Union::PeerInfo(pi)) => {
+                            #[cfg(any(target_os = "windows", target_os = "linux"))]
+                            if let Err(err) =
+                                self.commit_session_audit(audit_ready.as_ref(), peer).await
+                            {
+                                log::error!(
+                                    "Failed to commit controller-side session audit: {}",
+                                    err
+                                );
+                                self.handler.msgbox(
+                                    "error",
+                                    "Connection Error",
+                                    &format!("Session audit unavailable: {err}"),
+                                    "",
+                                );
                                 return false;
                             }
-                        }
-                        self.handler.handle_peer_info(pi);
-                        #[cfg(all(target_os = "windows", not(feature = "flutter")))]
-                        self.check_clipboard_file_context();
-                        if self.handler.is_default() {
-                            #[cfg(feature = "flutter")]
-                            #[cfg(not(target_os = "ios"))]
-                            let rx = Client::try_start_clipboard(None);
-                            #[cfg(not(feature = "flutter"))]
-                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            let rx = Client::try_start_clipboard(Some(
-                                crate::client::ClientClipboardContext {
-                                    cfg: self.handler.get_permission_config(),
-                                    tx: self.sender.clone(),
-                                    #[cfg(feature = "unix-file-copy-paste")]
-                                    is_file_supported: crate::is_support_file_copy_paste(
-                                        &peer_version,
-                                    ),
-                                },
-                            ));
-                            // To make sure current text clipboard data is updated.
-                            #[cfg(not(target_os = "ios"))]
-                            if let Some(mut rx) = rx {
-                                timeout(CLIPBOARD_INTERVAL, rx.recv()).await.ok();
-                            }
-
-                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            if self.handler.lc.read().unwrap().sync_init_clipboard.v {
-                                if let Some(msg_out) = crate::clipboard::get_current_clipboard_msg(
-                                    &peer_version,
-                                    &peer_platform,
-                                    crate::clipboard::ClipboardSide::Client,
-                                ) {
-                                    let sender = self.sender.clone();
-                                    let permission_config = self.handler.get_permission_config();
-                                    tokio::spawn(async move {
-                                        if permission_config.is_text_clipboard_required() {
-                                            sender.send(Data::Message(msg_out)).ok();
-                                        }
-                                    });
+                            let peer_version = pi.version.clone();
+                            let peer_platform = pi.platform.clone();
+                            self.set_peer_info(&pi);
+                            if self.handler.is_view_camera() {
+                                if !self.check_view_camera_support(&peer_version, &peer_platform) {
+                                    self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                                    return false;
                                 }
                             }
-                            // to-do: Android, is `sync_init_clipboard` really needed?
-                            // https://github.com/rustdesk/rustdesk/discussions/9010
+                            if self.handler.is_terminal() {
+                                if !self.check_terminal_support(&peer_version) {
+                                    self.handler.lc.write().unwrap().handle_peer_info(&pi);
+                                    return false;
+                                }
+                            }
+                            self.handler.handle_peer_info(pi);
+                            #[cfg(all(target_os = "windows", not(feature = "flutter")))]
+                            self.check_clipboard_file_context();
+                            if self.handler.is_default() {
+                                #[cfg(feature = "flutter")]
+                                #[cfg(not(target_os = "ios"))]
+                                let rx = Client::try_start_clipboard(None);
+                                #[cfg(not(feature = "flutter"))]
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                let rx = Client::try_start_clipboard(Some(
+                                    crate::client::ClientClipboardContext {
+                                        cfg: self.handler.get_permission_config(),
+                                        tx: self.sender.clone(),
+                                        #[cfg(feature = "unix-file-copy-paste")]
+                                        is_file_supported: crate::is_support_file_copy_paste(
+                                            &peer_version,
+                                        ),
+                                    },
+                                ));
+                                // To make sure current text clipboard data is updated.
+                                #[cfg(not(target_os = "ios"))]
+                                if let Some(mut rx) = rx {
+                                    timeout(CLIPBOARD_INTERVAL, rx.recv()).await.ok();
+                                }
 
-                            #[cfg(feature = "flutter")]
-                            #[cfg(not(target_os = "ios"))]
-                            crate::flutter::update_text_clipboard_required();
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                if self.handler.lc.read().unwrap().sync_init_clipboard.v {
+                                    if let Some(msg_out) =
+                                        crate::clipboard::get_current_clipboard_msg(
+                                            &peer_version,
+                                            &peer_platform,
+                                            crate::clipboard::ClipboardSide::Client,
+                                        )
+                                    {
+                                        let sender = self.sender.clone();
+                                        let permission_config =
+                                            self.handler.get_permission_config();
+                                        tokio::spawn(async move {
+                                            if permission_config.is_text_clipboard_required() {
+                                                sender.send(Data::Message(msg_out)).ok();
+                                            }
+                                        });
+                                    }
+                                }
+                                // to-do: Android, is `sync_init_clipboard` really needed?
+                                // https://github.com/rustdesk/rustdesk/discussions/9010
 
-                            #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
-                            crate::flutter::update_file_clipboard_required();
+                                #[cfg(feature = "flutter")]
+                                #[cfg(not(target_os = "ios"))]
+                                crate::flutter::update_text_clipboard_required();
 
-                            // on connection established client
-                            #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            crate::plugin::handle_listen_event(
-                                crate::plugin::EVENT_ON_CONN_CLIENT.to_owned(),
-                                self.handler.get_id(),
-                            );
+                                #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
+                                crate::flutter::update_file_clipboard_required();
+
+                                // on connection established client
+                                #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                crate::plugin::handle_listen_event(
+                                    crate::plugin::EVENT_ON_CONN_CLIENT.to_owned(),
+                                    self.handler.get_id(),
+                                );
+                            }
+
+                            if self.handler.is_file_transfer() {
+                                self.handler.load_last_jobs();
+                            }
+
+                            self.is_connected = true;
                         }
-
-                        if self.handler.is_file_transfer() {
-                            self.handler.load_last_jobs();
-                        }
-
-                        self.is_connected = true;
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Some(message::Union::CursorData(cd)) => {
                     self.handler.set_cursor_data(cd);
                 }
@@ -1871,6 +1938,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(misc::Union::CloseReason(c)) => {
+                        self.peer_close_requested = true;
                         self.sent_close_reason = true; // The controlled end will close, no need to send close reason
                         self.handler.msgbox("error", "Connection Error", &c, "");
                         return false;
@@ -2159,6 +2227,64 @@ impl<T: InvokeUiSession> Remote<T> {
                 .flatten()
                 .unwrap_or(false);
         }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    async fn commit_session_audit(
+        &mut self,
+        ready: Option<&AuditReady>,
+        peer: &mut Stream,
+    ) -> ResultType<()> {
+        let (direct, expected_id, existing) = {
+            let login = self.handler.lc.read().unwrap();
+            (
+                login.direct == Some(true),
+                login.audit_session_id,
+                login.audit_session.clone(),
+            )
+        };
+        if !direct {
+            return Ok(());
+        }
+        let ready = ready.ok_or_else(|| anyhow!("controlled peer did not provide AuditReady"))?;
+        let session_id = uuid::Uuid::from_slice(&ready.session_id)
+            .map_err(|err| anyhow!("invalid session audit id: {err}"))?;
+        if session_id != expected_id {
+            return Err(anyhow!(
+                "controlled peer returned a mismatched session audit id"
+            ));
+        }
+        let remote = ready
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow!("controlled peer omitted its audit identity"))?;
+        let session = existing.unwrap_or_else(|| {
+            AuditSession::new(
+                session_id,
+                Role::Controller,
+                Endpoint::new(
+                    peer.local_addr().ip().to_string(),
+                    crate::whoami_hostname(),
+                    crate::platform::get_active_username(),
+                ),
+                Endpoint::new(
+                    remote.ip.clone(),
+                    remote.hostname.clone(),
+                    remote.login_username.clone(),
+                ),
+            )
+        });
+        session.reconnected();
+        session.start().await?;
+        self.handler.lc.write().unwrap().audit_session = Some(session);
+
+        let mut message = Message::new();
+        message.set_audit_commit(AuditCommit {
+            session_id: ready.session_id.clone(),
+            ..Default::default()
+        });
+        peer.send(&message).await?;
+        Ok(())
     }
 
     async fn handle_back_notification(&mut self, notification: BackNotification) -> bool {

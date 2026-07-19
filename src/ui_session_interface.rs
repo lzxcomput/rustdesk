@@ -1300,6 +1300,20 @@ impl<T: InvokeUiSession> Session<T> {
         let round = connection_round_state_lock.new_round();
         drop(connection_round_state_lock);
 
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            let mut login = self.lc.write().unwrap();
+            if login
+                .audit_session
+                .as_ref()
+                .map(|session| session.is_ended())
+                .unwrap_or(false)
+            {
+                login.audit_session_id = uuid::Uuid::now_v7();
+                login.audit_session = None;
+            }
+        }
+
         let cloned = self.clone();
 
         // override only if true

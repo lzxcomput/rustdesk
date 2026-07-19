@@ -27,6 +27,8 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use crate::session_audit::AuditSession;
 use crate::{
     check_port,
     common::input::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP},
@@ -1768,6 +1770,10 @@ pub struct LoginConfigHandler {
     pub enable_trusted_devices: bool,
     pub record_state: bool,
     pub record_permission: bool,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    pub audit_session_id: Uuid,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    pub audit_session: Option<AuditSession>,
 }
 
 impl Deref for LoginConfigHandler {
@@ -1882,6 +1888,11 @@ impl LoginConfigHandler {
         self.shared_password = shared_password;
         self.record_state = false;
         self.record_permission = true;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            self.audit_session_id = Uuid::now_v7();
+            self.audit_session = None;
+        }
 
         // `std::env::remove_var("IS_TERMINAL_ADMIN");` is called in `session_add_sync()` - `flutter_ffi.rs`.
         let is_terminal_admin = conn_type == ConnType::TERMINAL
@@ -2665,13 +2676,13 @@ impl LoginConfigHandler {
             avatar = serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option(
                 "user_info",
             ))
-            .ok()
-            .and_then(|x| {
-                x.get("avatar")
-                    .and_then(|x| x.as_str())
-                    .map(|x| x.trim().to_owned())
-            })
-            .unwrap_or_default();
+                    .ok()
+                    .and_then(|x| {
+                        x.get("avatar")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x.trim().to_owned())
+                    })
+                    .unwrap_or_default();
         }
         avatar = resolve_avatar_url(avatar);
         let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);
@@ -2736,6 +2747,20 @@ impl LoginConfigHandler {
             avatar,
             ..Default::default()
         };
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if self.direct == Some(true) {
+            lr.audit = Some(AuditContext {
+                session_id: Bytes::copy_from_slice(self.audit_session_id.as_bytes()),
+                endpoint: Some(AuditEndpoint {
+                    hostname: crate::whoami_hostname(),
+                    login_username: crate::platform::get_active_username(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into();
+        }
         match self.conn_type {
             ConnType::FILE_TRANSFER => lr.set_file_transfer(FileTransfer {
                 dir: self.get_remote_dir(),
